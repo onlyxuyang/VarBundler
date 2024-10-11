@@ -1,3 +1,4 @@
+use fs_extra::file::read_to_string;
 use glob::glob;
 use glob::Pattern;
 use json::JsonValue;
@@ -17,6 +18,7 @@ use walkdir::{DirEntry, WalkDir};
 use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
+use normalize_path::NormalizePath;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
@@ -43,22 +45,34 @@ fn show_message_box(title: &str, message: &str) {
     }
 }
 
-fn extract_dep_list(node: &mut JsonValue, files: &mut Vec<String>) {
+fn extract_dep_files_from_json(filename: &Path, node: &mut JsonValue, files: &mut Vec<String>) {
     if node.is_object() {
         for (_, value) in node.entries_mut() {
-            extract_dep_list(value, files);
+            extract_dep_files_from_json(filename, value, files);
         }
     } else if node.is_array() {
         for value in node.members_mut() {
-            extract_dep_list(value, files);
+            extract_dep_files_from_json(filename, value, files);
         }
     } else if node.is_string() {
         let node_str = node.as_str().unwrap();
         if node_str.contains(":/") {
-            files.push(node_str.to_string());
-            *node = JsonValue::from(
-                node_str.replace(&node_str[0..node_str.find(":/").unwrap()], "SELF"),
+            if node_str.starts_with("SELF") {
+                files.push(node_str.split(":").collect::<Vec<&str>>()[1][1..].to_string());
+            } else {
+                files.push(node_str.to_string());
+            }
+        } else if node_str.ends_with(".jpg") || node_str.ends_with(".png") {
+            let abs_path = filename.parent().unwrap().join(node_str).normalize();
+            files.push(
+                abs_path
+                    .to_slash_lossy()
+                    .to_string()
+                    .to_string()
+                    .replace(r"\", "/"),
             );
+        } else if node_str.starts_with("/") {
+            files.push(node_str.to_string()[1..].to_string());
         }
     }
 }
@@ -90,24 +104,115 @@ fn find_latest_varname(var_name: &str, var_files: &HashMap<String, LinkedList<Pa
     return f_varname.to_string();
 }
 
-fn copy_dep_from_var(
+fn extract_filelist_from_var(var_path: &Path) -> Vec<String> {
+    let archive = match zip::ZipArchive::new(
+        fs::File::open(var_path)
+            .expect(format!("Could not open file {}", var_path.to_string_lossy()).as_str()),
+    ) {
+        Ok(ret) => ret,
+        Err(_) => {
+            println!("zipfile {} is invaild", var_path.to_string_lossy());
+            panic!()
+        }
+    };
+    archive
+        .file_names()
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+}
+fn extract_file_from_var(filename: &str, var_path: &PathBuf) -> String {
+    let mut archive = match zip::ZipArchive::new(
+        fs::File::open(var_path)
+            .expect(format!("Could not open file {}", var_path.to_string_lossy()).as_str()),
+    ) {
+        Ok(ret) => ret,
+        Err(_) => {
+            println!("zipfile {} is invaild", var_path.to_string_lossy());
+            panic!()
+        }
+    };
+    let mut file = match archive.by_name(filename) {
+        Ok(tfile) => tfile,
+        Err(_) => {
+            println!("file error, ignore");
+            panic!()
+        }
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
+    text
+}
+
+fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
+    let mut files = Vec::<String>::new();
+    if filename.ends_with(".vmi") {
+        files.push(filename[0..filename.len() - 3].to_string() + "vmb");
+    } else if filename.ends_with(".vam") {
+        let basename = filename[0..filename.len() - 3].to_string();
+        files.push(basename.clone() + "vaj");
+        files.push(basename.clone() + "vab");
+        files.push(basename.clone() + "jpg");
+        files.push(basename.clone() + "png");
+        let json_str = extract_file_from_var(&(basename + "vaj"), var_path);
+        let mut json_obj = json::parse(&json_str).unwrap();
+        let mut dep_files = Vec::new();
+        extract_dep_files_from_json(Path::new(filename), &mut json_obj, &mut dep_files);
+        files.extend(dep_files);
+    } else if filename.ends_with(".cslist") {
+        for line in extract_file_from_var(filename, var_path).lines() {
+            if line.starts_with("/") {
+                files.push(line[1..].to_string());
+            } else {
+                let abs_path = Path::new(filename).parent().unwrap().join(line).normalize();
+                files.push(
+                    abs_path
+                        .to_slash_lossy()
+                        .to_string()
+                        .to_string()
+                        .replace(r"\", "/"),
+                );
+            }
+        }
+    } else if filename.ends_with(".json") {
+        let basename = filename[0..filename.len() - 4].to_string();
+        files.push(basename.clone() + "jpg");
+        files.push(basename.clone() + "png");
+        let json_str = extract_file_from_var(filename, var_path);
+        let mut json_obj = json::parse(&json_str).unwrap();
+        let mut dep_files = Vec::new();
+        extract_dep_files_from_json(Path::new(filename), &mut json_obj, &mut dep_files);
+        files.extend(dep_files);
+    }
+    files
+}
+
+fn extract_dep_from_var(
     var_name: &str,
     target_folder: &Path,
     file_lists: &Vec<String>,
     var_files: &HashMap<String, LinkedList<PathBuf>>,
 ) {
-    let mut is_plugin = false;
-    for file in file_lists.iter() {
-        if file.ends_with("cslist") {
-            is_plugin = true;
-            break;
-        }
+    let var_path;
+    if var_name.ends_with(".var") {
+        var_path = Path::new(var_name);
+    } else {
+        let f_var_name = find_latest_varname(var_name, var_files);
+        var_path = match var_files.get(&f_var_name) {
+            Some(p) => p.front().unwrap(),
+            None => return,
+        };
     }
-    let f_var_name = find_latest_varname(var_name, var_files);
-    let var_path = match var_files.get(&f_var_name) {
-        Some(p) => p.front().unwrap(),
-        None => return,
-    };
+
+    let mut extend_file_lists = file_lists
+        .iter()
+        .map(|x| x.clone())
+        .collect::<Vec<String>>();
+    for file in file_lists {
+        extend_file_lists.extend(handle_nested_dep_files(
+            file,
+            &PathBuf::new().join(var_path),
+        ));
+    }
     let mut archive = match zip::ZipArchive::new(
         fs::File::open(var_path)
             .expect(format!("Could not open file {}", var_path.to_string_lossy()).as_str()),
@@ -119,33 +224,6 @@ fn copy_dep_from_var(
         }
     };
     let var_unpack_path = Path::new(target_folder);
-    let mut extra_file_lists = Vec::<String>::new();
-    for i in 0..archive.len() {
-        let mut file = match archive.by_index(i) {
-            Ok(tfile) => tfile,
-            Err(_) => {
-                println!("file error, ignore");
-                continue;
-            }
-        };
-        let outpath = match file.enclosed_name() {
-            Some(path) => path,
-            None => continue,
-        };
-        if outpath.extension().is_some_and(|x| x == "vaj") {
-            let mut vaj_json_str = String::new();
-            file.read_to_string(&mut vaj_json_str).unwrap();
-            let mut vaj_json = json::parse(&vaj_json_str).unwrap();
-            let mut files = Vec::new();
-            extract_dep_list(&mut vaj_json, &mut files);
-            for file in files {
-                let parts = file.split(":/").collect::<Vec<&str>>();
-                println!("in vaj file: {}", parts[1]);
-                extra_file_lists.push(parts[1].to_string());
-            }
-        }
-    }
-
     for i in 0..archive.len() {
         let mut file = match archive.by_index(i) {
             Ok(tfile) => tfile,
@@ -162,16 +240,7 @@ fn copy_dep_from_var(
         let realoutpath = var_unpack_path.join(&outpath);
 
         if !file.is_dir() {
-            if outpath.to_string_lossy() == "meta.json" {
-                continue;
-            }
-
-            if is_plugin
-                || file_lists
-                    .iter()
-                    .any(|x| outpath.to_string_lossy().starts_with(x))
-                || extra_file_lists.contains(&outpath.to_string_lossy().to_string())
-            {
+            if extend_file_lists.contains(&&outpath.to_string_lossy().to_string()) {
                 if let Some(p) = realoutpath.parent() {
                     if !p.exists() {
                         fs::create_dir_all(p).unwrap();
@@ -181,6 +250,23 @@ fn copy_dep_from_var(
                 io::copy(&mut file, &mut outfile).unwrap();
             }
         }
+    }
+    let mut extra_var_file_lists: HashMap<String, Vec<String>> = HashMap::new();
+    for file in extend_file_lists.iter() {
+        if !file.contains(":") {
+            continue;
+        }
+        let parts = file.split(":").collect::<Vec<&str>>();
+        if !extra_var_file_lists.contains_key(parts[0]) {
+            extra_var_file_lists.insert(parts[0].to_string(), Vec::new());
+        }
+        extra_var_file_lists
+            .get_mut(parts[0])
+            .unwrap()
+            .push(parts[1][1..].to_string());
+    }
+    for (k, v) in extra_var_file_lists.iter() {
+        extract_dep_from_var(k, var_unpack_path, v, var_files);
     }
 }
 
@@ -209,6 +295,8 @@ fn generate_meta_json(var_unpack_path: &Path) {
     }
     meta_json["contentList"] = json::from(file_lists);
     meta_json["dependencies"] = json::object! {};
+    meta_json["hadReferenceIssues"] = json::from("false");
+    meta_json["referenceIssues"] = json::array![];
     fs::write(&meta_json_path, json::stringify_pretty(meta_json, 4)).expect("Unable to write file");
 }
 
@@ -277,18 +365,49 @@ fn zip_one_file(
     Ok(())
 }
 
-fn get_norm_filename(filename: &str) -> String {
-    if filename.ends_with(".vmi") {
-        return String::from(&filename[0..filename.len() - 4]);
+fn rewrite_dep_files_from_json(node: &mut JsonValue) {
+    if node.is_object() {
+        for (_, value) in node.entries_mut() {
+            rewrite_dep_files_from_json(value);
+        }
+    } else if node.is_array() {
+        for value in node.members_mut() {
+            rewrite_dep_files_from_json(value);
+        }
+    } else if node.is_string() {
+        let node_str = node.as_str().unwrap();
+        if node_str.contains(":/") {
+            if !node_str.starts_with("SELF") {
+                let parts = node_str.split(":").collect::<Vec<&str>>();
+                *node = JsonValue::from(String::from("SELF:") + parts[1]);
+            }
+        }
     }
-    if filename.ends_with(".vam") {
-        return Path::new(filename)
-            .parent()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+}
+
+fn rewrite_all_json_file(var_unpack_path: &Path) {
+    let mut pattern = format!(
+        "{}/**/*.json",
+        Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
+    );
+    for entry in glob(&pattern).expect("Failed to read glob pattern") {
+        let en = entry.unwrap();
+        let json_str = fs::read_to_string(&en).unwrap();
+        let mut json_obj = json::parse(&json_str).unwrap();
+        rewrite_dep_files_from_json(&mut json_obj);
+        fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
     }
-    return String::from(filename);
+    pattern = format!(
+        "{}/**/*.vaj",
+        Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
+    );
+    for entry in glob(&pattern).expect("Failed to read glob pattern") {
+        let en = entry.unwrap();
+        let json_str = fs::read_to_string(&en).unwrap();
+        let mut json_obj = json::parse(&json_str).unwrap();
+        rewrite_dep_files_from_json(&mut json_obj);
+        fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
+    }
 }
 
 fn repack_bundled_var(
@@ -296,76 +415,16 @@ fn repack_bundled_var(
     tmp_folder: &str,
     var_files: &HashMap<String, LinkedList<PathBuf>>,
 ) -> PathBuf {
-    let mut archive = match zip::ZipArchive::new(
-        fs::File::open(var_path).expect(format!("Could not open file {}", var_path).as_str()),
-    ) {
-        Ok(ret) => ret,
-        Err(_) => {
-            println!("zipfile {} is invaild", var_path);
-            panic!()
-        }
-    };
-
     let var_unpack_path = Path::new(tmp_folder).join(Path::new(var_path).file_name().unwrap());
-    for i in 0..archive.len() {
-        let mut file = match archive.by_index(i) {
-            Ok(tfile) => tfile,
-            Err(_) => {
-                println!("file error, ignore");
-                continue;
-            }
-        };
-        let outpath = match file.enclosed_name() {
-            Some(path) => path,
-            None => continue,
-        };
 
-        let realoutpath = var_unpack_path.join(outpath);
-
-        if file.is_dir() {
-            fs::create_dir_all(&realoutpath).unwrap();
-        } else {
-            if let Some(p) = realoutpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p).unwrap();
-                }
-            }
-            let mut outfile = fs::File::create(&realoutpath).unwrap();
-            io::copy(&mut file, &mut outfile).unwrap();
-        }
-    }
-
-    let pattern = format!(
-        "{}/**/*.json",
-        Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
-    );
-
-    for entry in glob(&pattern).expect("Failed to read glob pattern") {
-        let scene_json_path = entry.unwrap();
-        let scene_json_str =
-            fs::read_to_string(&scene_json_path).expect("Should have been able to read the file");
-        let mut scene_json = json::parse(&scene_json_str).unwrap();
-        let mut files = Vec::new();
-        extract_dep_list(&mut scene_json, &mut files);
-        let modified_scene_json = json::stringify_pretty(scene_json, 4);
-        fs::write(&scene_json_path, modified_scene_json).expect("Unable to write file");
-
-        let mut var_file_lists: HashMap<String, Vec<String>> = HashMap::new();
-        for file in files.iter() {
-            let parts = file.split(":/").collect::<Vec<&str>>();
-            if !var_file_lists.contains_key(parts[0]) {
-                var_file_lists.insert(parts[0].to_string(), Vec::new());
-            }
-            var_file_lists
-                .get_mut(parts[0])
-                .unwrap()
-                .push(get_norm_filename(parts[1]));
-        }
-        for (k, v) in var_file_lists.iter() {
-            copy_dep_from_var(k, &var_unpack_path, v, var_files);
-        }
-    }
+    let mut filelist = extract_filelist_from_var(Path::new(var_path));
+    filelist = filelist
+        .into_iter()
+        .filter(|x| x.ends_with(".json"))
+        .collect::<Vec<String>>();
+    extract_dep_from_var(var_path, &var_unpack_path, &filelist, var_files);
     generate_meta_json(&var_unpack_path);
+    rewrite_all_json_file(&var_unpack_path);
     let dst_file = Path::new(tmp_folder).join(
         String::from("[Bundled]")
             + Path::new(var_path)
@@ -406,24 +465,21 @@ fn generate_var_list(var_folder: &str) -> HashMap<String, LinkedList<PathBuf>> {
 
 fn main() {
     let args: Vec<_> = env::args().collect();
-    //std::env::set_current_dir(Path::new(args.get(0).unwrap()).parent().unwrap()).unwrap();
+    std::env::set_current_dir(Path::new(args.get(0).unwrap()).parent().unwrap()).unwrap();
     if !fs::exists("VaM.exe").unwrap() {
         println!("Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
         show_message_box("Error/错误", "Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
         return;
     }
-    //let target = args.get(1).unwrap();
-    let target = r"C:\Games\VAM\VAM-VAM\AddonPackages_xxx\02月第一周场景周更新内容\andywongusa全场景\地铁痴娘最终版\Subway Game Final\andywongusa.SubwayFinal.1.var";
+    let target = args.get(1).unwrap();
     println!(
         "repacking {name} to bundled var\n正在将{name}重打包为bundled var",
         name = target
     );
 
     let vam_folder = env::current_dir().unwrap();
-    // let var_folder = &vam_folder.join("AddonPackages");
-    // let dst_tmp_folder = &PathBuf::from(&vam_folder).join("VarBundler");
-    let var_folder = &vam_folder.join("AddonPackages_xxx");
-    let dst_tmp_folder = &PathBuf::from(&vam_folder).join("AddonPackages");
+    let var_folder = &vam_folder.join("AddonPackages");
+    let dst_tmp_folder = &PathBuf::from(&vam_folder).join("VarBundler");
     let var_list = generate_var_list(&var_folder.to_string_lossy());
     let filename = repack_bundled_var(target, &dst_tmp_folder.to_string_lossy(), &var_list);
 

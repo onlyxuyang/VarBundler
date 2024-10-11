@@ -10,6 +10,7 @@ dependencies = [
  "fs_extra",
  "glob",
  "json",
+ "normalize-path",
  "path-slash",
  "walkdir",
  "winapi",
@@ -360,6 +361,12 @@ checksum = "e2d80299ef12ff69b16a84bb182e3b9df68b5a91574d3d4fa6e41b65deec4df1"
 dependencies = [
  "adler2",
 ]
+
+[[package]]
+name = "normalize-path"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5438dd2b2ff4c6df6e1ce22d825ed2fa93ee2922235cc45186991717f0a892d"
 
 [[package]]
 name = "num-conv"
