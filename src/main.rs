@@ -1,4 +1,3 @@
-use fs_extra::file::read_to_string;
 use glob::glob;
 use glob::Pattern;
 use json::JsonValue;
@@ -15,6 +14,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use walkdir::{DirEntry, WalkDir};
+use winreg::RegKey;
 use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
@@ -154,7 +154,7 @@ fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
         files.push(basename.clone() + "jpg");
         files.push(basename.clone() + "png");
         let json_str = extract_file_from_var(&(basename + "vaj"), var_path);
-        let mut json_obj = json::parse(&json_str).unwrap();
+        let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
         let mut dep_files = Vec::new();
         extract_dep_files_from_json(Path::new(filename), &mut json_obj, &mut dep_files);
         files.extend(dep_files);
@@ -274,7 +274,16 @@ fn generate_meta_json(var_unpack_path: &Path) {
     let meta_json_path = var_unpack_path.join("meta.json");
     let meta_json_str =
         fs::read_to_string(&meta_json_path).expect("Should have been able to read the file");
-    let mut meta_json = json::parse(&meta_json_str).unwrap();
+    let mut meta_json = match json::parse(&meta_json_str) {
+        Ok(json_obj) => json_obj,
+        Err(_) => {
+            show_message_box(
+                "Error/错误",
+                "Package meta data is incorrect\n此数据包元数据错误",
+            );
+            panic!();
+        }
+    };
     let mut file_lists = Vec::<String>::new();
     let pattern = format!(
         "{}/**/*",
@@ -393,7 +402,7 @@ fn rewrite_all_json_file(var_unpack_path: &Path) {
     for entry in glob(&pattern).expect("Failed to read glob pattern") {
         let en = entry.unwrap();
         let json_str = fs::read_to_string(&en).unwrap();
-        let mut json_obj = json::parse(&json_str).unwrap();
+        let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
         rewrite_dep_files_from_json(&mut json_obj);
         fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
     }
@@ -404,7 +413,7 @@ fn rewrite_all_json_file(var_unpack_path: &Path) {
     for entry in glob(&pattern).expect("Failed to read glob pattern") {
         let en = entry.unwrap();
         let json_str = fs::read_to_string(&en).unwrap();
-        let mut json_obj = json::parse(&json_str).unwrap();
+        let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
         rewrite_dep_files_from_json(&mut json_obj);
         fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
     }
@@ -425,18 +434,12 @@ fn repack_bundled_var(
     extract_dep_from_var(var_path, &var_unpack_path, &filelist, var_files);
     generate_meta_json(&var_unpack_path);
     rewrite_all_json_file(&var_unpack_path);
-    let dst_file = Path::new(tmp_folder).join(
-        String::from("[Bundled]")
-            + Path::new(var_path)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-                .as_str(),
+    let dst_file = Path::new(var_path).parent().unwrap().join(
+        String::from("[Bundled]") + Path::new(var_path).file_name().unwrap().to_str().unwrap(),
     );
     zip_one_file(&var_unpack_path, &dst_file, zip::CompressionMethod::Stored).unwrap();
-    if fs::exists(&var_unpack_path).unwrap() {
-        fs::remove_dir_all(&var_unpack_path).unwrap();
+    if fs::exists(&tmp_folder).unwrap() {
+        fs::remove_dir_all(&tmp_folder).unwrap();
     }
     dst_file
 }
@@ -463,25 +466,92 @@ fn generate_var_list(var_folder: &str) -> HashMap<String, LinkedList<PathBuf>> {
     var_files
 }
 
+fn find_game_folder(var_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut current_dir = var_path.parent();
+    let mut child_dir = PathBuf::new();
+
+    while let Some(dir) = current_dir {
+        let vam_exe_path = dir.join("VaM.exe");
+        if vam_exe_path.exists() {
+            return Some((dir.to_path_buf(), child_dir));
+        }
+        current_dir = dir.parent();
+        child_dir = dir.to_path_buf();
+    }
+    None
+}
+
 fn main() {
     let args: Vec<_> = env::args().collect();
-    std::env::set_current_dir(Path::new(args.get(0).unwrap()).parent().unwrap()).unwrap();
-    if !fs::exists("VaM.exe").unwrap() {
-        println!("Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
-        show_message_box("Error/错误", "Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
-        return;
+    let vam_exe_path = Path::new(args.get(0).unwrap())
+        .parent()
+        .unwrap()
+        .join("VaM.exe");
+    if !vam_exe_path.exists() {
+        show_message_box(
+            "Error/错误",
+            "Please path progame as same folder as VaM.exe\n请将程序文件放在VaM.exe所在目录",
+        );
     }
-    let target = args.get(1).unwrap();
+    if args.len() == 1 {
+        let hkcr = RegKey::predef(winreg::enums::HKEY_CLASSES_ROOT);
+        let (var_key, _) = match hkcr.create_subkey(".var") {
+            Ok((key, dis)) => (key, dis),
+            Err(_) => {
+                show_message_box(
+                    "Error/错误",
+                    "Please try again with 'runas administrator'\n请使用右键菜单'以管理员身份运行'",
+                );
+                return;
+            }
+        };
+        var_key.set_value("", &"VamDataFile").unwrap();
+
+        if hkcr.open_subkey("VamDataFile").is_ok() {
+            hkcr.delete_subkey_all("VamDataFile").unwrap();
+            show_message_box(
+                "Remove Bundled Var Context Menu/移除BundledVar上下文菜单",
+                "Done, Generate Bundled Var Context Menu removed\nGenerate Bundled Var上下文菜单已移除",
+            );
+            return;
+        }
+        let (var_file_key, _) = hkcr.create_subkey("VamDataFile").unwrap();
+        let shell_path = "shell\\GenerateBundledVar";
+        let (icon_key, _) = var_file_key.create_subkey("DefaultIcon").unwrap();
+        icon_key
+            .set_value("", &format!("\"{}\",0", vam_exe_path.to_slash_lossy()))
+            .unwrap();
+        let (shell_key, _) = var_file_key.create_subkey(shell_path).unwrap();
+        shell_key.set_value("", &"Generate Bundled Var").unwrap();
+        let (command_key, _) = shell_key.create_subkey("command").unwrap();
+        command_key
+            .set_value("", &format!("\"{}\" \"%1\"", args.get(0).unwrap()))
+            .unwrap();
+        show_message_box(
+            "Add Var File Context Menu/添加Var类型文件上下文菜单",
+            "Done, Generate Bundled Var Context Menu added\nNow you can right click .var file and choose 'Generate Bundled Var'\n\nGenerate Bundled Var上下文菜单已添加,请在.var文件右键菜单选择'Generate Bundled Var'",
+        );
+    }
+    let var_path = Path::new(args.get(1).unwrap());
+    let (vam_folder, var_folder) = match find_game_folder(var_path) {
+        Some((game_folder, var_folder)) => (game_folder, var_folder),
+        None => {
+            println!("Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
+            show_message_box("Error/错误", "Please put VarBundler.exe under VaM folder which includes VaM.exe \n请将VarBundler.exe放在VaM.exe同级目录下");
+            return;
+        }
+    };
     println!(
         "repacking {name} to bundled var\n正在将{name}重打包为bundled var",
-        name = target
+        name = var_path.to_string_lossy()
     );
-
-    let vam_folder = env::current_dir().unwrap();
-    let var_folder = &vam_folder.join("AddonPackages");
     let dst_tmp_folder = &PathBuf::from(&vam_folder).join("VarBundler");
     let var_list = generate_var_list(&var_folder.to_string_lossy());
-    let filename = repack_bundled_var(target, &dst_tmp_folder.to_string_lossy(), &var_list);
+    let filename = repack_bundled_var(
+        var_path.to_str().unwrap(),
+        &dst_tmp_folder.to_string_lossy(),
+        &var_list,
+    );
 
     show_message_box(
         "Success/成功",
