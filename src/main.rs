@@ -13,6 +13,8 @@ use std::io::Seek;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use threadpool::ThreadPool;
+use threadpool_scope::scope_with;
 use walkdir::{DirEntry, WalkDir};
 use winreg::RegKey;
 use zip::result::ZipError;
@@ -62,7 +64,10 @@ fn extract_dep_files_from_json(filename: &Path, node: &mut JsonValue, files: &mu
             } else {
                 files.push(node_str.to_string());
             }
-        } else if node_str.ends_with(".jpg") || node_str.ends_with(".png") {
+        } else if node_str.ends_with(".jpg")
+            || node_str.ends_with(".png")
+            || node_str.ends_with(".tif")
+        {
             let abs_path = filename.parent().unwrap().join(node_str).normalize();
             files.push(
                 abs_path
@@ -112,6 +117,10 @@ fn extract_filelist_from_var(var_path: &Path) -> Vec<String> {
         Ok(ret) => ret,
         Err(_) => {
             println!("zipfile {} is invaild", var_path.to_string_lossy());
+            show_message_box(
+                "Error/错误",
+                format!("zipfile {} is invaild", var_path.to_string_lossy()).as_str(),
+            );
             panic!()
         }
     };
@@ -120,6 +129,7 @@ fn extract_filelist_from_var(var_path: &Path) -> Vec<String> {
         .map(|x| x.to_string())
         .collect::<Vec<String>>()
 }
+
 fn extract_file_from_var(filename: &str, var_path: &PathBuf) -> String {
     let mut archive = match zip::ZipArchive::new(
         fs::File::open(var_path)
@@ -128,6 +138,10 @@ fn extract_file_from_var(filename: &str, var_path: &PathBuf) -> String {
         Ok(ret) => ret,
         Err(_) => {
             println!("zipfile {} is invaild", var_path.to_string_lossy());
+            show_message_box(
+                "Error/错误",
+                format!("zipfile {} is invaild", var_path.to_string_lossy()).as_str(),
+            );
             panic!()
         }
     };
@@ -135,7 +149,7 @@ fn extract_file_from_var(filename: &str, var_path: &PathBuf) -> String {
         Ok(tfile) => tfile,
         Err(_) => {
             println!("file error, ignore");
-            panic!()
+            return json::object! {}.to_string();
         }
     };
     let mut text = String::new();
@@ -153,6 +167,7 @@ fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
         files.push(basename.clone() + "vab");
         files.push(basename.clone() + "jpg");
         files.push(basename.clone() + "png");
+        files.push(basename.clone() + "tif");
         let json_str = extract_file_from_var(&(basename + "vaj"), var_path);
         let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
         let mut dep_files = Vec::new();
@@ -163,7 +178,11 @@ fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
             if line.starts_with("/") {
                 files.push(line[1..].to_string());
             } else {
-                let abs_path = Path::new(filename).parent().unwrap().join(line).normalize();
+                let abs_path = Path::new(filename)
+                    .parent()
+                    .unwrap()
+                    .join(line.trim())
+                    .normalize();
                 files.push(
                     abs_path
                         .to_slash_lossy()
@@ -177,12 +196,14 @@ fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
         let basename = filename[0..filename.len() - 4].to_string();
         files.push(basename.clone() + "jpg");
         files.push(basename.clone() + "png");
+        files.push(basename.clone() + "tif");
         let json_str = extract_file_from_var(filename, var_path);
         let mut json_obj = json::parse(&json_str).unwrap();
         let mut dep_files = Vec::new();
         extract_dep_files_from_json(Path::new(filename), &mut json_obj, &mut dep_files);
         files.extend(dep_files);
     }
+    files = files.into_iter().map(|x| x).collect::<Vec<String>>();
     files
 }
 
@@ -206,6 +227,9 @@ fn extract_dep_from_var(
     let mut extend_file_lists = file_lists
         .iter()
         .map(|x| x.clone())
+        .collect::<Vec<String>>()
+        .into_iter()
+        .filter(|x| !fs::exists(target_folder.join(&x)).unwrap())
         .collect::<Vec<String>>();
     for file in file_lists {
         extend_file_lists.extend(handle_nested_dep_files(
@@ -240,7 +264,11 @@ fn extract_dep_from_var(
         let realoutpath = var_unpack_path.join(&outpath);
 
         if !file.is_dir() {
-            if extend_file_lists.contains(&&outpath.to_string_lossy().to_string()) {
+            if extend_file_lists
+                .iter()
+                .find(|x| x.to_lowercase() == outpath.to_string_lossy().to_string().to_lowercase())
+                .is_some()
+            {
                 if let Some(p) = realoutpath.parent() {
                     if !p.exists() {
                         fs::create_dir_all(p).unwrap();
@@ -265,9 +293,14 @@ fn extract_dep_from_var(
             .unwrap()
             .push(parts[1][1..].to_string());
     }
-    for (k, v) in extra_var_file_lists.iter() {
-        extract_dep_from_var(k, var_unpack_path, v, var_files);
-    }
+    let pool = ThreadPool::new(12);
+    scope_with(&pool, |scope| {
+        for (k, v) in extra_var_file_lists.iter() {
+            scope.execute(move || {
+                extract_dep_from_var(k, var_unpack_path, v, var_files);
+            });
+        }
+    });
 }
 
 fn generate_meta_json(var_unpack_path: &Path) {
@@ -318,10 +351,10 @@ fn zip_dir<T>(
 where
     T: Write + Seek,
 {
-    let mut zip = zip::ZipWriter::new(writer);
+    let mut zip: zip::ZipWriter<T> = zip::ZipWriter::new(writer);
     let options = SimpleFileOptions::default()
         .compression_method(method)
-        .unix_permissions(0o755)
+        .large_file(true)
         .with_alignment(4096);
 
     let prefix = Path::new(prefix);
@@ -374,19 +407,20 @@ fn zip_one_file(
     Ok(())
 }
 
-fn rewrite_dep_files_from_json(node: &mut JsonValue) {
+fn rewrite_dep_files_from_json(node: &mut JsonValue, record: &mut Vec<String>) {
     if node.is_object() {
         for (_, value) in node.entries_mut() {
-            rewrite_dep_files_from_json(value);
+            rewrite_dep_files_from_json(value, record);
         }
     } else if node.is_array() {
         for value in node.members_mut() {
-            rewrite_dep_files_from_json(value);
+            rewrite_dep_files_from_json(value, record);
         }
     } else if node.is_string() {
         let node_str = node.as_str().unwrap();
         if node_str.contains(":/") {
             if !node_str.starts_with("SELF") {
+                record.push(node_str.to_string());
                 let parts = node_str.split(":").collect::<Vec<&str>>();
                 *node = JsonValue::from(String::from("SELF:") + parts[1]);
             }
@@ -395,28 +429,36 @@ fn rewrite_dep_files_from_json(node: &mut JsonValue) {
 }
 
 fn rewrite_all_json_file(var_unpack_path: &Path) {
-    let mut pattern = format!(
-        "{}/**/*.json",
-        Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
+    let mut paths = glob(
+        format!(
+            "{}/**/*.json",
+            Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
+        )
+        .as_str(),
+    )
+    .unwrap()
+    .map(|x| x.unwrap())
+    .collect::<Vec<PathBuf>>();
+    paths.extend(
+        glob(
+            format!(
+                "{}/**/*.vaj",
+                Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
+            )
+            .as_str(),
+        )
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect::<Vec<PathBuf>>(),
     );
-    for entry in glob(&pattern).expect("Failed to read glob pattern") {
-        let en = entry.unwrap();
-        let json_str = fs::read_to_string(&en).unwrap();
+    let mut record = Vec::<String>::new();
+    for entry in paths {
+        let json_str = fs::read_to_string(&entry).unwrap();
         let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
-        rewrite_dep_files_from_json(&mut json_obj);
-        fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
+        rewrite_dep_files_from_json(&mut json_obj, &mut record);
+        fs::write(&entry, json::stringify_pretty(json_obj, 4)).unwrap();
     }
-    pattern = format!(
-        "{}/**/*.vaj",
-        Pattern::escape(var_unpack_path.as_os_str().to_str().unwrap())
-    );
-    for entry in glob(&pattern).expect("Failed to read glob pattern") {
-        let en = entry.unwrap();
-        let json_str = fs::read_to_string(&en).unwrap();
-        let mut json_obj = json::parse(&json_str).unwrap_or(json::object! {});
-        rewrite_dep_files_from_json(&mut json_obj);
-        fs::write(&en, json::stringify_pretty(json_obj, 4)).unwrap();
-    }
+    fs::write(var_unpack_path.join("record.list"), record.join("\n")).unwrap();
 }
 
 fn repack_bundled_var(
@@ -492,6 +534,7 @@ fn main() {
             "Error/错误",
             "Please path progame as same folder as VaM.exe\n请将程序文件放在VaM.exe所在目录",
         );
+        return;
     }
     if args.len() == 1 {
         let hkcr = RegKey::predef(winreg::enums::HKEY_CLASSES_ROOT);
