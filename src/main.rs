@@ -64,9 +64,9 @@ fn extract_dep_files_from_json(filename: &Path, node: &mut JsonValue, files: &mu
             } else {
                 files.push(node_str.to_string());
             }
-        } else if node_str.ends_with(".jpg")
-            || node_str.ends_with(".png")
-            || node_str.ends_with(".tif")
+        } else if node_str.to_lowercase().ends_with(".jpg")
+            || node_str.to_lowercase().ends_with(".png")
+            || node_str.to_lowercase().ends_with(".tif")
         {
             let abs_path = filename.parent().unwrap().join(node_str).normalize();
             files.push(
@@ -173,25 +173,8 @@ fn handle_nested_dep_files(filename: &str, var_path: &PathBuf) -> Vec<String> {
         let mut dep_files = Vec::new();
         extract_dep_files_from_json(Path::new(filename), &mut json_obj, &mut dep_files);
         files.extend(dep_files);
-    } else if filename.ends_with(".cslist") {
-        for line in extract_file_from_var(filename, var_path).lines() {
-            if line.starts_with("/") {
-                files.push(line[1..].to_string());
-            } else {
-                let abs_path = Path::new(filename)
-                    .parent()
-                    .unwrap()
-                    .join(line.trim())
-                    .normalize();
-                files.push(
-                    abs_path
-                        .to_slash_lossy()
-                        .to_string()
-                        .to_string()
-                        .replace(r"\", "/"),
-                );
-            }
-        }
+    } else if filename.ends_with(".cslist") || filename.ends_with(".cs") {
+        files.extend(extract_filelist_from_var(var_path));
     } else if filename.ends_with(".json") {
         let basename = filename[0..filename.len() - 4].to_string();
         files.push(basename.clone() + "jpg");
